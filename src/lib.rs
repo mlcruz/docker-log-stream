@@ -1,8 +1,15 @@
-use std::{borrow::Cow, collections::HashSet, error::Error};
+use std::{borrow::Cow, collections::HashSet, error::Error, process::abort};
 
-use hyper::{body::HttpBody, Client};
+use hyper::{
+    body::{Bytes, HttpBody},
+    Client,
+};
 use hyperlocal::{UnixClientExt, UnixConnector, Uri};
 use once_cell::sync::Lazy;
+use tokio::{
+    sync::mpsc::{Receiver, UnboundedReceiver},
+    task::JoinHandle,
+};
 
 static UNIX_CLIENT: Lazy<Client<UnixConnector>> = Lazy::new(|| Client::unix());
 static CONTAINERS_ENDPOINT: Lazy<hyper::Uri> =
@@ -10,14 +17,50 @@ static CONTAINERS_ENDPOINT: Lazy<hyper::Uri> =
 
 #[derive(Debug)]
 pub struct DockerSystem {
-    running_containers: HashSet<Vec<u8>>,
+    running_containers: HashSet<[u8; 12]>,
+}
+
+pub struct DockerLog {
+    id: String,
+    handle: JoinHandle<()>,
+    stdout_rx: UnboundedReceiver<Bytes>,
+}
+
+impl DockerLog {
+    pub async fn new(id: String) -> Result<Self, Box<dyn Error>> {
+        let logs_uri = hyperlocal::Uri::new(
+            "/var/run/docker.sock",
+            &format!("/containers/{}/logs?stdout=1&follow=1", &id),
+        )
+        .into();
+
+        let mut response = UNIX_CLIENT.get(logs_uri).await?;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+        let handle = tokio::spawn(async move {
+            while let Some(data) = response.data().await {
+                match data {
+                    Ok(data) => {
+                        tx.send(data).unwrap();
+                    }
+                    Err(err) => abort(),
+                }
+            }
+        });
+
+        Ok(Self {
+            id,
+            handle,
+            stdout_rx: rx,
+        })
+    }
 }
 
 impl DockerSystem {
     // rust-analyzer.experimental.procAttrMacros
     async fn refresh_containers(&mut self) -> Result<(), Box<dyn Error>> {
         let mut response = UNIX_CLIENT.get(CONTAINERS_ENDPOINT.clone()).await.unwrap();
-        dbg!(response.size_hint());
         let mut buf: Vec<u8> = Vec::with_capacity(
             (response
                 .size_hint()
@@ -36,12 +79,17 @@ impl DockerSystem {
             .as_array()
             .unwrap()
             .into_iter()
-            .map(|v| hex::decode(v.get("Id").unwrap().as_str().unwrap()).unwrap())
+            .map(|v| {
+                let bytes = &v.get("Id").unwrap().as_str().unwrap().as_bytes()[0..12];
+                let mut arr = [0u8; 12];
+                arr.clone_from_slice(bytes);
+                arr
+            })
             .collect::<HashSet<_>>();
 
         let new = currently_running
             .difference(&self.running_containers)
-            .map(|f| f.to_vec())
+            .map(|f| f.clone())
             .collect::<Vec<_>>();
 
         self.running_containers.extend(new);
@@ -49,7 +97,7 @@ impl DockerSystem {
         let dropped = self
             .running_containers
             .difference(&currently_running)
-            .map(|f| f.to_vec())
+            .map(|f| f.clone())
             .collect::<Vec<_>>();
 
         for drop in dropped {
@@ -61,7 +109,7 @@ impl DockerSystem {
     fn running_containers(&self) -> Vec<String> {
         self.running_containers
             .iter()
-            .map(|c| hex::encode(&c[0..6]))
+            .map(|c| hex::encode(hex::decode(std::str::from_utf8(c).unwrap()).unwrap()))
             .collect::<Vec<_>>()
     }
 
@@ -85,7 +133,7 @@ mod tests {
     };
     use hyperlocal::{UnixClientExt, Uri};
 
-    use crate::DockerSystem;
+    use crate::{DockerLog, DockerSystem};
 
     #[tokio::test]
     async fn list_containers_test() {
@@ -96,15 +144,15 @@ mod tests {
 
     #[tokio::test]
     async fn socket_open() {
-        let url = Uri::new(
-            "/var/run/docker.sock",
-            "/containers/3fe658779d14/logs?stdout=1&stderr=1&follow=1",
-        )
-        .into();
+        let system = DockerSystem::new().await.unwrap();
 
-        let client = Client::unix();
+        let mut log = DockerLog::new(system.running_containers().first().unwrap().to_string())
+            .await
+            .unwrap();
+        while let Some(r) = log.stdout_rx.recv().await {
+            dbg!(std::str::from_utf8(&r).unwrap());
+        }
 
-        let mut response = client.get(url).await.unwrap();
-        let foo = response.into_body().data();
+        log.handle.await.unwrap();
     }
 }
