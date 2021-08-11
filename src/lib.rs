@@ -1,15 +1,16 @@
-use std::{borrow::Cow, collections::HashSet, error::Error, process::abort};
+use std::{
+    collections::HashSet,
+    error::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use hyper::{
     body::{Bytes, HttpBody},
     Client,
 };
-use hyperlocal::{UnixClientExt, UnixConnector, Uri};
+use hyperlocal::{UnixClientExt, UnixConnector};
 use once_cell::sync::Lazy;
-use tokio::{
-    sync::mpsc::{Receiver, UnboundedReceiver},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 static UNIX_CLIENT: Lazy<Client<UnixConnector>> = Lazy::new(|| Client::unix());
 static CONTAINERS_ENDPOINT: Lazy<hyper::Uri> =
@@ -20,46 +21,79 @@ pub struct DockerSystem {
     running_containers: HashSet<[u8; 12]>,
 }
 
-pub struct DockerLog {
-    id: String,
-    handle: JoinHandle<()>,
-    stdout_rx: UnboundedReceiver<Bytes>,
+pub struct ContainerLog {
+    pub id: String,
+    pub handle: JoinHandle<()>,
+    pub stdout: UnboundedReceiver<Bytes>,
+    pub stderr: UnboundedReceiver<Bytes>,
 }
 
-impl DockerLog {
+impl ContainerLog {
     pub async fn new(id: String) -> Result<Self, Box<dyn Error>> {
-        let logs_uri = hyperlocal::Uri::new(
+        let stdout_uri = hyperlocal::Uri::new(
             "/var/run/docker.sock",
             &format!("/containers/{}/logs?stdout=1&follow=1", &id),
         )
         .into();
 
-        let mut response = UNIX_CLIENT.get(logs_uri).await?;
+        let mut response = UNIX_CLIENT.get(stdout_uri).await?;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
-        let handle = tokio::spawn(async move {
+        let stdout_handle = tokio::spawn(async move {
             while let Some(data) = response.data().await {
                 match data {
                     Ok(data) => {
-                        tx.send(data).unwrap();
+                        stdout_tx.send(data).unwrap();
                     }
-                    Err(err) => abort(),
+                    Err(_err) => panic!(),
                 }
             }
+        });
+
+        let start = SystemTime::now();
+        let now = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        let stderr_uri = hyperlocal::Uri::new(
+            "/var/run/docker.sock",
+            &format!("/containers/{}/logs?stderr=1&follow=1&since={}", &id, now),
+        )
+        .into();
+
+        let mut response = UNIX_CLIENT.get(stderr_uri).await?;
+        let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+        let stderr_handle = tokio::spawn(async move {
+            while let Some(data) = response.data().await {
+                match data {
+                    Ok(data) => {
+                        stderr_tx.send(data).unwrap();
+                    }
+                    Err(_err) => panic!(),
+                }
+            }
+        });
+
+        let handle = tokio::spawn(async move {
+            stdout_handle.await.unwrap();
+            stderr_handle.await.unwrap();
         });
 
         Ok(Self {
             id,
             handle,
-            stdout_rx: rx,
+            stdout: stdout_rx,
+            stderr: stderr_rx,
         })
     }
 }
 
 impl DockerSystem {
     // rust-analyzer.experimental.procAttrMacros
-    async fn refresh_containers(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn refresh_containers(&mut self) -> Result<(), Box<dyn Error>> {
         let mut response = UNIX_CLIENT.get(CONTAINERS_ENDPOINT.clone()).await.unwrap();
         let mut buf: Vec<u8> = Vec::with_capacity(
             (response
@@ -106,14 +140,14 @@ impl DockerSystem {
         Ok(())
     }
 
-    fn running_containers(&self) -> Vec<String> {
+    pub fn running_containers(&self) -> Vec<String> {
         self.running_containers
             .iter()
             .map(|c| hex::encode(hex::decode(std::str::from_utf8(c).unwrap()).unwrap()))
             .collect::<Vec<_>>()
     }
 
-    async fn new() -> Result<Self, Box<dyn Error>> {
+    pub async fn new() -> Result<Self, Box<dyn Error>> {
         let mut s = Self {
             running_containers: Default::default(),
         };
@@ -125,19 +159,12 @@ impl DockerSystem {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
-    use hyper::{
-        body::{Bytes, HttpBody},
-        Client,
-    };
-    use hyperlocal::{UnixClientExt, Uri};
-
-    use crate::{DockerLog, DockerSystem};
+    use crate::{ContainerLog, DockerSystem};
 
     #[tokio::test]
     async fn list_containers_test() {
-        let mut system = DockerSystem::new().await.unwrap();
+        let system = DockerSystem::new().await.unwrap();
 
         println!("{:#?}", system.running_containers());
     }
@@ -146,11 +173,13 @@ mod tests {
     async fn socket_open() {
         let system = DockerSystem::new().await.unwrap();
 
-        let mut log = DockerLog::new(system.running_containers().first().unwrap().to_string())
+        let mut log = ContainerLog::new(system.running_containers().first().unwrap().to_string())
             .await
             .unwrap();
-        while let Some(r) = log.stdout_rx.recv().await {
-            dbg!(std::str::from_utf8(&r).unwrap());
+
+        while let Some(r) = log.stdout.recv().await {
+            std::str::from_utf8(&r).unwrap();
+            break;
         }
 
         log.handle.await.unwrap();
