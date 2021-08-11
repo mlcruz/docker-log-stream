@@ -40,7 +40,7 @@ impl ContainerLog {
 
         let stdout_uri = hyperlocal::Uri::new(
             "/var/run/docker.sock",
-            &format!("/containers/{}/logs?stdout=1&follow=1&since={}", &id, now),
+            &format!("/containers/{}/logs?stdout=1&follow=1", &id),
         )
         .into();
 
@@ -61,12 +61,12 @@ impl ContainerLog {
             try_join!(
                 tokio::spawn(async move {
                     while let Some(data) = stdout_response.data().await {
-                        stderr_tx.send(data.unwrap()).unwrap();
+                        stdout_tx.send(data.unwrap()).unwrap();
                     }
                 }),
                 tokio::spawn(async move {
                     while let Some(data) = stderr_response.data().await {
-                        stdout_tx.send(data.unwrap()).unwrap();
+                        stderr_tx.send(data.unwrap()).unwrap();
                     }
                 })
             )
@@ -160,7 +160,7 @@ impl DockerSystem {
 #[cfg(test)]
 mod tests {
 
-    use crate::{ContainerLog, DockerSystem};
+    use crate::DockerSystem;
 
     #[tokio::test]
     async fn list_containers_test() {
@@ -173,15 +173,10 @@ mod tests {
     async fn socket_open() {
         let system = DockerSystem::new().await.unwrap();
 
-        let mut log = ContainerLog::new(system.running_containers().first().unwrap().to_string())
-            .await
-            .unwrap();
-
-        while let Some(r) = log.stdout.recv().await {
-            std::str::from_utf8(&r).unwrap();
+        for (key, mut value) in system.container_logs {
+            let msg = value.stdout.recv().await.unwrap();
+            dbg!(msg);
             break;
         }
-
-        log.handle.await.unwrap();
     }
 }
