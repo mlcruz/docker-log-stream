@@ -57,6 +57,22 @@ impl DockerSystem {
         }
         Ok(())
     }
+
+    fn running_containers(&self) -> Vec<String> {
+        self.running_containers
+            .iter()
+            .map(|c| hex::encode(&c[0..6]))
+            .collect::<Vec<_>>()
+    }
+
+    async fn new() -> Result<Self, Box<dyn Error>> {
+        let mut s = Self {
+            running_containers: Default::default(),
+        };
+
+        s.refresh_containers().await.unwrap();
+        Ok(s)
+    }
 }
 
 #[cfg(test)]
@@ -73,12 +89,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_containers_test() {
-        let mut system = DockerSystem {
-            running_containers: HashSet::new(),
-        };
+        let mut system = DockerSystem::new().await.unwrap();
 
-        system.refresh_containers().await;
-        dbg!(system);
+        println!("{:#?}", system.running_containers());
     }
 
     #[tokio::test]
